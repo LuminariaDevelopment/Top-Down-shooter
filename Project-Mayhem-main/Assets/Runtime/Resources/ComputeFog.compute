@@ -1,0 +1,283 @@
+#pragma kernel ComputeFog
+
+#pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+
+#pragma multi_compile _ _ADDITIONAL_LIGHT_SHADOWS
+
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
+
+struct AetherLightData
+{
+    float4x4 mat;
+    float3 position;
+    float3 direction;
+    float3 color;
+    float intensity;
+    float angle;
+    int shadowSliceIndex;
+    int type;
+};
+
+struct CameraData
+{
+    float3 position;
+    float4x4 inverseViewMatrix;
+    float aspect;
+    float fov;
+    float near;
+    float far;
+};
+
+struct AetherFogData
+{
+    float4x4 trs;
+    float3 minimum;
+    float3 maximum;
+    float3 color;
+    float density;
+    float scatterCoefficient;
+    int type;
+};
+
+RWTexture3D<float4> previousFogTexture;
+
+RWTexture3D<float4> fogTexture;
+float3 fogTextureResolution;
+
+StructuredBuffer<CameraData> cameraData;
+
+StructuredBuffer<AetherFogData> fogData;
+uint fogDataLength;
+
+StructuredBuffer<AetherLightData> lightData;
+uint lightDataLength;
+
+//uint sampleCount;
+
+Texture2D<float> mainShadowTexture;
+SamplerState sampler_mainShadowTexture;
+bool useMainShadowTexture;
+
+Texture2D<float> additionalShadowTexture;
+SamplerState sampler_additionalShadowTexture;
+
+Texture2D<float4> blueNoise;
+SamplerState sampler_blueNoise;
+float blueNoiseSize;
+
+float time;
+float jitterDistance;
+float jitterScale;
+float temporalStrength;
+
+float SampleMainShadowMap(float4 shadowCoord)
+{
+    float shadowSample = -9999;
+    if(useMainShadowTexture) shadowSample = mainShadowTexture.SampleLevel(sampler_mainShadowTexture, shadowCoord.xy, 0.0f).r;
+    return shadowSample;
+}
+
+float SampleAdditionalShadowMap(AetherLightData light, float3 worldPos, out float4 shadowCoord)
+{
+
+    shadowCoord = mul(light.mat, float4(worldPos, 1.0f));
+    shadowCoord.xyz /= shadowCoord.w;
+
+    shadowCoord.xy = shadowCoord.xy * 0.5f + 0.5f;
+	shadowCoord.y = 1.0f - shadowCoord.y;
+
+    return additionalShadowTexture.SampleLevel(sampler_additionalShadowTexture, shadowCoord.xy, 0.0f).r;
+}
+
+float4 GetRayDirection (float3 id, CameraData camera)
+{
+    float x = ((id.x + .5) / fogTextureResolution.x) * camera.aspect * 2.0 - camera.aspect;
+    float y = ((id.y + .5) / fogTextureResolution.y) * 2.0 - 1.0;
+    float z = -(1.0 / tan(radians(camera.fov) / 2.0));
+    return normalize(float4(x, y, z, 0.0));
+}
+
+float3 GetWorldPosition(uint3 id, float jitter, CameraData camera)
+{
+    float4 rayDir = GetRayDirection(float3(id), camera);
+
+    // Transform ray direction to world space
+    float3 worldRayDir = mul(camera.inverseViewMatrix, rayDir).xyz;
+
+    // Calculate distance to intersection with near/far planes
+    float t = (id.z + jitter) / (fogTextureResolution.z);
+    float distance = (camera.near / abs(rayDir.z)) + t * (camera.far / abs(rayDir.z));
+
+    // Return intersection point in world space
+    return camera.position + normalize(worldRayDir) * distance;
+}
+
+float3 GetWorldPositionJittered(uint3 id, float jitterScale, float jitterDistance, CameraData camera)
+{
+    float jitter = .0001 * jitterScale;
+    float2 coord = (float2(id.xy) * jitter * float(id.z) * jitter * blueNoiseSize) + float2(time/2, time*10) % blueNoiseSize;
+    float noise = lerp(0, jitterDistance, blueNoise.SampleLevel(sampler_blueNoise, coord, 0.0f).r);
+
+    return GetWorldPosition(id, noise, camera);
+}
+
+float4 LocalFog (AetherFogData fog, float3 worldPos, out float scatterCoefficient)
+{
+    float3 s = step(fog.minimum, worldPos) - step(fog.maximum, worldPos);
+    float dist = s.x * s.y * s.z;
+    
+    scatterCoefficient = lerp(0, fog.scatterCoefficient, dist);
+
+    return lerp(float4(0, 0, 0, 0), float4(fog.color, fog.density), dist);
+}
+
+float4 GlobalFog (AetherFogData fog, float3 worldPos, out float scatterCoefficient)
+{
+    scatterCoefficient = fog.scatterCoefficient;
+    return float4(fog.color, fog.density);
+}
+
+float4 SampleFog (float3 worldPos, float3 viewDirection, out float scatterCoefficient)
+{
+    float4 fogColor = 0;
+
+    for(uint fogID = 0; fogID < fogDataLength; fogID++)
+    {
+        AetherFogData fog = fogData[fogID];
+
+        float4 fogOut = 0;
+        float scatter = 0;
+        switch(fog.type)
+        {
+            case 0: //local
+                fogOut = LocalFog(fog, worldPos, scatter);
+                break;
+            case 1: //global
+                fogOut = GlobalFog(fog, worldPos, scatter);
+                break;
+        }
+
+        scatterCoefficient += scatter;
+        fogColor += fogOut;
+    }
+
+    scatterCoefficient = saturate(scatterCoefficient);
+
+    return fogColor;
+}
+
+float3 PointLight (AetherLightData light, float3 worldPos)
+{
+    float distance = max(0.0, length(light.position - worldPos));
+    float attenuation = 1 / (1 + 0.12 * distance + 1 * distance * distance);
+
+    float intensity = light.intensity * attenuation * 10;
+
+    return light.color * intensity;
+}
+
+float3 DirectionalLight(AetherLightData light, float3 worldPos)
+{
+    float attenuation = 1;
+
+    float4 shadowCoord = TransformWorldToShadowCoord(worldPos);
+	float shadowAtten = SampleMainShadowMap(shadowCoord);
+
+    attenuation *= shadowAtten < shadowCoord.z;
+
+    return light.color * light.intensity * attenuation;
+}
+
+float3 SpotLight(AetherLightData light, float3 worldPos)
+{
+    float distance = max(0.0, length(light.position - worldPos));
+    float attenuation = 1.0 / (1.0 + 0.01 * distance + 0.1 * distance * distance);
+
+    float angle = light.angle / 2.0;
+    float inner = angle - 10.0;
+    float outer = angle;
+
+    float intensity = light.intensity * attenuation * saturate((dot(light.direction, normalize(worldPos - light.position)) - cos(radians(outer))) / (cos(radians(inner)) - cos(radians(outer))));
+
+    //! Only works for one spotlight
+    // float4 shadowCoord;
+    // float shadowAtten = SampleAdditionalShadowMap(light, worldPos, shadowCoord);
+
+    // intensity *= shadowAtten < shadowCoord.z;
+
+    return light.color * intensity;
+}
+
+float Anisotropy(float3 v, float3 l, float g)
+{
+    float costheta = dot(v, l);
+	float gsq = g*g;
+	float denom = 1 + gsq - 2.0 * g * costheta;
+	denom = denom * denom * denom;
+	denom = sqrt(max(0, denom));
+
+	return (1 - gsq) / denom;
+}
+
+float3 SampleLights (float3 worldPos, float3 viewDirection, float scatterCoefficient)
+{
+    float3 color = 0;
+
+    for(uint lightID = 0; lightID < lightDataLength; lightID++)
+    {
+        AetherLightData light = lightData[lightID];
+
+        float3 lightDirection = normalize(worldPos - light.position);
+
+        switch(light.type)
+        {
+            case 0: //Spot
+                color += SpotLight(light, worldPos) * Anisotropy(viewDirection, lightDirection, scatterCoefficient);
+                break;
+            case 1: //Directional
+                color += DirectionalLight(light, worldPos) * Anisotropy(viewDirection, light.direction, scatterCoefficient);
+                break;
+            case 2: //Point
+                color += PointLight(light, worldPos) * Anisotropy(viewDirection, lightDirection, scatterCoefficient);
+                break;
+        }
+    }
+
+    return color;
+}
+
+
+float4 Sample (float3 worldPos, float3 viewDirection)
+{
+    float scatterCoefficient;
+    float4 fog = SampleFog(worldPos, viewDirection, scatterCoefficient);
+    float3 light = SampleLights(worldPos, viewDirection, scatterCoefficient);
+
+    float scattering = 0.025 * fog.a;
+    float absorption = 0.001 * fog.a;
+
+    return float4(light * fog.rgb * scattering, scattering + absorption);
+}
+
+float nrand(float2 uv)
+{
+    return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+[numthreads(16, 9, 2)]
+void ComputeFog (uint3 id : SV_DispatchThreadID)
+{
+    CameraData camera = cameraData[0];
+
+    float3 worldPos = GetWorldPositionJittered(id, jitterScale, jitterDistance, camera);
+    float3 viewDirection = normalize(camera.position - worldPos);
+
+    float4 previousSample = previousFogTexture[id];
+    float4 currentSample = Sample(worldPos, viewDirection);
+
+    fogTexture[id] = lerp(currentSample, previousSample, saturate(temporalStrength));
+
+    previousFogTexture[id] = fogTexture[id];
+}
